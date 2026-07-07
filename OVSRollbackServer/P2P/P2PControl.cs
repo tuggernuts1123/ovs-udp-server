@@ -136,6 +136,99 @@ namespace OVS.Rollback.P2P
         }
 
         // ═══════════════════════════════════════════
+        //  Parse (server → client) — mirror of the Build* encoders below.
+        //  The client (ASI, or a test) decodes coordinator output with this.
+        // ═══════════════════════════════════════════
+
+        public readonly struct P2PServerInbound
+        {
+            public P2PSubtype Subtype { get; init; }
+            public PeerRole Role { get; init; }
+            public P2PMode Mode { get; init; }
+            public IPEndPoint? Endpoint { get; init; }              // RegisterAck reflexive / UseDirect peer
+            public ushort PeerIndex { get; init; }                 // UseDirect / UseRelay
+            public ushort SrcPlayerIndex { get; init; }            // RelayDeliver
+            public ushort StartDelayMs { get; init; }              // PunchNow
+            public byte Attempts { get; init; }                    // PunchNow
+            public ushort IntervalMs { get; init; }                // PunchNow
+            public IReadOnlyList<(ushort index, PeerRole role, IPEndPoint ep)> Peers { get; init; } // PeerList
+            public ReadOnlyMemory<byte> Data { get; init; }        // RelayDeliver
+        }
+
+        /// <summary>Decode a server→client control datagram. Returns null if malformed.</summary>
+        public static P2PServerInbound? ParseServer(ReadOnlySpan<byte> buffer)
+        {
+            if (buffer.Length < HeaderSize) return null;
+            var subtype = (P2PSubtype)buffer[5];
+            int o = HeaderSize;
+            try
+            {
+                switch (subtype)
+                {
+                    case P2PSubtype.RegisterAck:
+                    {
+                        var role = (PeerRole)buffer[o++];
+                        var mode = (P2PMode)buffer[o++];
+                        var ip = ReadStr8(buffer, ref o);
+                        ushort port = ReadU16(buffer, ref o);
+                        return new P2PServerInbound { Subtype = subtype, Role = role, Mode = mode, Endpoint = MakeEp(ip, port) };
+                    }
+                    case P2PSubtype.PeerList:
+                    {
+                        byte count = buffer[o++];
+                        var list = new List<(ushort, PeerRole, IPEndPoint)>(count);
+                        for (int i = 0; i < count; i++)
+                        {
+                            ushort idx = ReadU16(buffer, ref o);
+                            var role = (PeerRole)buffer[o++];
+                            var ip = ReadStr8(buffer, ref o);
+                            ushort port = ReadU16(buffer, ref o);
+                            var ep = MakeEp(ip, port);
+                            if (ep is null) return null;
+                            list.Add((idx, role, ep));
+                        }
+                        return new P2PServerInbound { Subtype = subtype, Peers = list };
+                    }
+                    case P2PSubtype.PunchNow:
+                    {
+                        ushort delay = ReadU16(buffer, ref o);
+                        byte attempts = buffer[o++];
+                        ushort interval = ReadU16(buffer, ref o);
+                        return new P2PServerInbound { Subtype = subtype, StartDelayMs = delay, Attempts = attempts, IntervalMs = interval };
+                    }
+                    case P2PSubtype.UseRelay:
+                    {
+                        ushort peer = ReadU16(buffer, ref o);
+                        return new P2PServerInbound { Subtype = subtype, PeerIndex = peer };
+                    }
+                    case P2PSubtype.UseDirect:
+                    {
+                        ushort peer = ReadU16(buffer, ref o);
+                        var ip = ReadStr8(buffer, ref o);
+                        ushort port = ReadU16(buffer, ref o);
+                        return new P2PServerInbound { Subtype = subtype, PeerIndex = peer, Endpoint = MakeEp(ip, port) };
+                    }
+                    case P2PSubtype.RelayDeliver:
+                    {
+                        ushort src = ReadU16(buffer, ref o);
+                        ushort len = ReadU16(buffer, ref o);
+                        if (o + len > buffer.Length) return null;
+                        return new P2PServerInbound { Subtype = subtype, SrcPlayerIndex = src, Data = buffer.Slice(o, len).ToArray() };
+                    }
+                    default:
+                        return null;
+                }
+            }
+            catch (Exception e) when (e is ArgumentOutOfRangeException or IndexOutOfRangeException)
+            {
+                return null;
+            }
+        }
+
+        private static IPEndPoint? MakeEp(string ip, ushort port)
+            => IPAddress.TryParse(ip, out var a) ? new IPEndPoint(a, port) : null;
+
+        // ═══════════════════════════════════════════
         //  Build (server → client)
         // ═══════════════════════════════════════════
 
