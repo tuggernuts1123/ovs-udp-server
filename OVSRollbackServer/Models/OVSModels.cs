@@ -1,9 +1,39 @@
 // OvsModels.cs
 using System;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace OVS.Rollback.Models
 {
+    /// <summary>
+    /// Reads an int from ANY JSON token, returning 0 for anything it can't
+    /// interpret (non-numeric string, float, bool, null, array, object,
+    /// overflow). Used for p2p_mode so a malformed backend value degrades to
+    /// Off (0) instead of throwing during config deserialization — a throw
+    /// there aborts the ENTIRE match, not just P2P.
+    /// </summary>
+    public sealed class TolerantIntConverter : JsonConverter<int>
+    {
+        public override int Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        {
+            switch (reader.TokenType)
+            {
+                case JsonTokenType.Number:
+                    return reader.TryGetInt32(out int n) ? n : 0;
+                case JsonTokenType.String:
+                    return int.TryParse(reader.GetString(), out int v) ? v : 0;
+                case JsonTokenType.Null:
+                    return 0;
+                default:
+                    reader.Skip(); // consume a stray array/object so parsing continues
+                    return 0;
+            }
+        }
+
+        public override void Write(Utf8JsonWriter writer, int value, JsonSerializerOptions options)
+            => writer.WriteNumberValue(value);
+    }
+
     public class OvsPlayer
     {
         [JsonPropertyName("player_index")]
@@ -54,8 +84,7 @@ namespace OVS.Rollback.Models
         // deserialization — a throw here would abort the ENTIRE match, not just
         // disable P2P.
         [JsonPropertyName("p2p_mode")]
-        [System.Text.Json.Serialization.JsonNumberHandling(
-            System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString)]
+        [JsonConverter(typeof(TolerantIntConverter))]
         public int P2PModeRaw { get; set; } = 0;
 
         [JsonIgnore]

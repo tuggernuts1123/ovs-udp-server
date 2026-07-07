@@ -167,6 +167,17 @@ namespace OVS.Rollback.P2P
             {
                 var bucket = _pending.GetOrAdd(matchId, _ => new ConcurrentDictionary<ushort, IPEndPoint>());
                 bucket[playerIndex] = endpoint;
+
+                // Close the race where EnableMatch wrote _matchInfo and drained an
+                // empty bucket between our ContainsKey check and this write: if the
+                // match is now enabled, ingest this registration ourselves rather
+                // than leaving it stranded until the client's next retransmit.
+                if (_matchInfo.ContainsKey(matchId)
+                    && _pending.TryGetValue(matchId, out var b)
+                    && b.TryRemove(playerIndex, out var ep))
+                {
+                    IngestRegistration(matchId, playerIndex, ep);
+                }
                 return;
             }
 
