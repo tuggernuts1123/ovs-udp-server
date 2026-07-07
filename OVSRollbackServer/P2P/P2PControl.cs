@@ -207,6 +207,15 @@ namespace OVS.Rollback.P2P
             return buf;
         }
 
+        /// <summary>Client→server KeepAlive (also used by the guest proxy to keep its NAT mapping to the host open).</summary>
+        public static byte[] BuildKeepAlive(ushort playerIndex)
+        {
+            var buf = new byte[HeaderSize + 2];
+            int o = WriteHeader(buf, P2PSubtype.KeepAlive);
+            WriteU16(buf, ref o, playerIndex);
+            return buf;
+        }
+
         public static byte[] BuildRelayDeliver(ushort srcPlayerIndex, ReadOnlySpan<byte> data)
         {
             var buf = new byte[HeaderSize + 2 + 2 + data.Length];

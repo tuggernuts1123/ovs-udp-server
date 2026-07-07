@@ -141,6 +141,101 @@ namespace OVS.Rollback.Core
             }
         }
 
+        // ═══════════════════════════════════════════
+        //  Guest proxy mode (host-authority P2P)
+        // ═══════════════════════════════════════════
+
+        /// <summary>
+        /// Guest-side proxy loop. Runs instead of the authority loop when
+        /// P2P.Role="guest": forwards the local game (loopback) to the host
+        /// authority and the host's replies back to the game, while keeping the
+        /// guest→host NAT mapping open with magic-framed keepalives (which the
+        /// host intercepts before its game parser, so they never spam it). The
+        /// host endpoint is supplied by the launcher/coordinator via P2P.PeerAddress.
+        /// </summary>
+        private async Task RunProxyLoopAsync(IPEndPoint hostEndpoint)
+        {
+            var buffer = new byte[2048];
+            var anyEp = new IPEndPoint(IPAddress.Any, 0);
+            IPEndPoint? localGame = null;
+
+            _ = Task.Run(() => PunchKeepAliveAsync(hostEndpoint));
+
+            _ = Events.SendServerListeningEvent(this, StatusEventArgs.CreateNew(
+                    description: "ServerListening",
+                    matchEvent: "ServerListening",
+                    matchDescription: $"OVS guest proxy forwarding local game to host {hostEndpoint}"));
+
+            while (_running)
+            {
+                SocketReceiveFromResult result;
+                try
+                {
+                    result = await _socket.ReceiveFromAsync(buffer, SocketFlags.None, anyEp);
+                }
+                catch (OperationCanceledException) { break; }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.OperationAborted) { break; }
+                catch (Exception ex) { Log.ReceiveError(_logger, ex); if (!_running) break; continue; }
+
+                var remote = (IPEndPoint)result.RemoteEndPoint;
+                int n = result.ReceivedBytes;
+                if (n <= 0) continue;
+
+                if (IPAddress.IsLoopback(remote.Address))
+                {
+                    // Local game → host authority. Remember the game's ephemeral
+                    // endpoint so we can route host replies back to it.
+                    localGame = remote;
+                    SendProxy(buffer, n, hostEndpoint);
+                }
+                else if (remote.Port == hostEndpoint.Port && remote.Address.Equals(hostEndpoint.Address))
+                {
+                    // Host authority → local game.
+                    if (localGame is not null) SendProxy(buffer, n, localGame);
+                }
+                // else: stray datagram (unknown peer) — ignore.
+            }
+        }
+
+        /// <summary>Best-effort raw send used by the proxy paths (shares the send lock).</summary>
+        private void SendProxy(byte[] buf, int len, IPEndPoint dst)
+        {
+            lock (_sendLock)
+            {
+                try { _socket.SendTo(buf, 0, len, SocketFlags.None, dst); }
+                catch (SocketException) { /* best-effort */ }
+            }
+        }
+
+        /// <summary>
+        /// Keep the guest→host NAT mapping open with periodic magic-framed
+        /// KeepAlive control packets. Once the game is streaming inputs the
+        /// mapping stays open from that traffic too, but this covers the pre-game
+        /// window and lulls, and can't be misparsed by the host's game path.
+        /// </summary>
+        private async Task PunchKeepAliveAsync(IPEndPoint host)
+        {
+            var keepalive = P2PControl.BuildKeepAlive(
+                (ushort)ServerConfiguration.Instance.P2P.LocalPlayerIndex);
+            while (_running)
+            {
+                SendProxy(keepalive, keepalive.Length, host);
+                try { await Task.Delay(1000); }
+                catch { break; }
+            }
+        }
+
+        /// <summary>Parse an "ip:port" string to an endpoint, or null if malformed.</summary>
+        private static IPEndPoint? TryParseEndpoint(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            int i = s.LastIndexOf(':');
+            if (i <= 0 || i == s.Length - 1) return null;
+            if (!IPAddress.TryParse(s.Substring(0, i), out var addr)) return null;
+            if (!int.TryParse(s.Substring(i + 1), out var port) || port < 1 || port > 65535) return null;
+            return new IPEndPoint(addr, port);
+        }
+
         /// <summary>
         /// Build a match's P2P parameters from an ALREADY-FETCHED config. Called
         /// from HandleNewConnection under the match-creation lock, so no network
@@ -182,7 +277,29 @@ namespace OVS.Rollback.Core
 
             // ← NEW: Apply low-latency socket options (DSCP EF, buffers, DontFragment)
             _socket.Bind(new IPEndPoint(IPAddress.Any, _port));
-            _udpTask = Task.Run(RunUdpServerAsync);
+
+            // ── Run-mode select ──
+            // "guest" runs the lightweight proxy loop (local game <-> host
+            // authority) instead of the authoritative receive loop. Any other
+            // value ("cloud"/"host"/"auto") runs the normal authority loop; a
+            // local host additionally punches out to guests (handled by the
+            // coordinator once endpoints are known).
+            var role = (ServerConfiguration.Instance.P2P.Role ?? "cloud").Trim().ToLowerInvariant();
+            var hostEp = TryParseEndpoint(ServerConfiguration.Instance.P2P.PeerAddress);
+            if (role == "guest" && hostEp is not null)
+            {
+                _logger.LogInformation("[P2P] Starting in GUEST proxy mode → host {Host}", hostEp);
+                _udpTask = Task.Run(() => RunProxyLoopAsync(hostEp));
+            }
+            else
+            {
+                if (role == "guest")
+                {
+                    _logger.LogWarning("[P2P] Role=guest but PeerAddress '{Addr}' is invalid; falling back to authority loop.",
+                        ServerConfiguration.Instance.P2P.PeerAddress);
+                }
+                _udpTask = Task.Run(RunUdpServerAsync);
+            }
 
             _ = Events.SendServerListeningEvent(this, StatusEventArgs.CreateNew(
                      description: "ServerListening",

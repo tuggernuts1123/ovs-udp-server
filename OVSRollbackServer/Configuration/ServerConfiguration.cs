@@ -361,6 +361,9 @@ namespace OVS.Rollback.Configuration
             P2P.PunchStartDelayMs = GetEnvUShort("P2P__PunchStartDelayMs", P2P.PunchStartDelayMs);
             P2P.PeerLivenessTimeoutMs = GetEnvInt("P2P__PeerLivenessTimeoutMs", P2P.PeerLivenessTimeoutMs);
             P2P.RelayEnabled = GetEnvBool("P2P__RelayEnabled", P2P.RelayEnabled);
+            P2P.Role = GetEnvString("P2P__Role", P2P.Role) ?? "cloud";
+            P2P.PeerAddress = GetEnvString("P2P__PeerAddress", P2P.PeerAddress) ?? "";
+            P2P.LocalPlayerIndex = GetEnvInt("P2P__LocalPlayerIndex", P2P.LocalPlayerIndex);
 
             _logger?.LogDebug("{LogPrefix} Environment variables applied to configuration", LogPrefix);
         }
@@ -456,6 +459,25 @@ namespace OVS.Rollback.Configuration
 
         /// <summary>Whether the server acts as a TURN-style relay when a direct hole can't be opened.</summary>
         public bool RelayEnabled { get; set; } = true;
+
+        /// <summary>
+        /// Run mode for host-authority P2P:
+        ///   "cloud"  — dedicated authority (default, unchanged),
+        ///   "host"   — this machine runs the authority for a P2P match,
+        ///   "guest"  — this machine proxies its local game to the host.
+        /// "auto" behaves like cloud until a future connection-based detection lands.
+        /// </summary>
+        public string Role { get; set; } = "cloud";
+
+        /// <summary>
+        /// For guest mode: the host authority's "ip:port" to forward the local
+        /// game's traffic to (supplied by the launcher/coordinator). Empty in
+        /// cloud/host mode.
+        /// </summary>
+        public string PeerAddress { get; set; } = "";
+
+        /// <summary>This machine's team-side player index (used in guest-mode keepalives).</summary>
+        public int LocalPlayerIndex { get; set; } = 0;
     }
 
     public class GameLogicSettings
