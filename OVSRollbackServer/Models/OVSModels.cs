@@ -42,6 +42,19 @@ namespace OVS.Rollback.Models
         [JsonPropertyName("players")]
         public List<OvsPlayer> Players { get; set; } = [];
 
+        // P2P hole-punching mode for this match, chosen by the OVS backend:
+        //   0 = Off (classic dedicated-server relay, default and unchanged)
+        //   1 = Preferred (try direct peer paths, fall back to relay/authority)
+        //   2 = Forced (direct only; no relay)
+        // Absent in legacy configs → defaults to Off, so nothing changes unless
+        // the backend explicitly opts a match in.
+        [JsonPropertyName("p2p_mode")]
+        public byte P2PModeRaw { get; set; } = 0;
+
+        [JsonIgnore]
+        public P2P.P2PMode P2PMode =>
+            Enum.IsDefined(typeof(P2P.P2PMode), P2PModeRaw) ? (P2P.P2PMode)P2PModeRaw : P2P.P2PMode.Off;
+
         public int NumSpectators
         {
             get {

@@ -32,6 +32,12 @@ namespace OVS.Rollback.Configuration
         public DesyncDetectionSettings DesyncDetection { get; set; } = new();
         public LoggingSettings Logging { get; set; } = new();
 
+        // P2P hole-punching coordination. Off by default; threaded through the
+        // JSON file (P2P section) and env vars (P2P__*). Not part of the
+        // positional constructor — it defaults to new() and env overrides are
+        // applied in ApplyEnvironmentVariables (which Load() always runs).
+        public P2PNetworkingSettings P2P { get; set; } = new();
+
         /// <summary>
         /// Singleton instance with thread-safe access
         /// </summary>
@@ -346,6 +352,16 @@ namespace OVS.Rollback.Configuration
             Logging.LogTickPerformance = GetEnvBool("Logging__LogTickPerformance", Logging.LogTickPerformance);
             Logging.TickPerformanceInterval = GetEnvInt("Logging__TickPerformanceInterval", Logging.TickPerformanceInterval);
 
+            // P2P hole-punching settings
+            P2P.Enabled = GetEnvBool("P2P__Enabled", P2P.Enabled);
+            P2P.RegistrationTimeoutMs = GetEnvInt("P2P__RegistrationTimeoutMs", P2P.RegistrationTimeoutMs);
+            P2P.PunchWindowMs = GetEnvInt("P2P__PunchWindowMs", P2P.PunchWindowMs);
+            P2P.PunchAttempts = GetEnvByte("P2P__PunchAttempts", P2P.PunchAttempts);
+            P2P.PunchIntervalMs = GetEnvUShort("P2P__PunchIntervalMs", P2P.PunchIntervalMs);
+            P2P.PunchStartDelayMs = GetEnvUShort("P2P__PunchStartDelayMs", P2P.PunchStartDelayMs);
+            P2P.PeerLivenessTimeoutMs = GetEnvInt("P2P__PeerLivenessTimeoutMs", P2P.PeerLivenessTimeoutMs);
+            P2P.RelayEnabled = GetEnvBool("P2P__RelayEnabled", P2P.RelayEnabled);
+
             _logger?.LogDebug("{LogPrefix} Environment variables applied to configuration", LogPrefix);
         }
 
@@ -408,6 +424,38 @@ namespace OVS.Rollback.Configuration
         public int DscpValue { get; set; } = 46;
         public bool DontFragment { get; set; } = true;
         public int HttpTimeoutSeconds { get; set; } = 5;
+    }
+
+    /// <summary>
+    /// Tunables for the P2P hole-punching coordinator. Disabled by default —
+    /// the server behaves exactly like a classic dedicated relay until this is
+    /// turned on AND a match's config opts in via p2p_mode.
+    /// </summary>
+    public class P2PNetworkingSettings
+    {
+        /// <summary>Master switch. When false the coordinator is never created.</summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>How long to wait for all peers to register before proceeding with whoever showed up (>=2) or giving up.</summary>
+        public int RegistrationTimeoutMs { get; set; } = 4000;
+
+        /// <summary>How long to wait for punch confirmations before routing unresolved pairs via relay.</summary>
+        public int PunchWindowMs { get; set; } = 3000;
+
+        /// <summary>Number of punch datagrams each client fires at each peer.</summary>
+        public byte PunchAttempts { get; set; } = 8;
+
+        /// <summary>Delay between successive punch datagrams (ms).</summary>
+        public ushort PunchIntervalMs { get; set; } = 100;
+
+        /// <summary>Lead time in the PunchNow signal so all clients start punching at roughly the same instant (ms).</summary>
+        public ushort PunchStartDelayMs { get; set; } = 250;
+
+        /// <summary>Evict a coordination session after every peer has been silent this long (ms).</summary>
+        public int PeerLivenessTimeoutMs { get; set; } = 15000;
+
+        /// <summary>Whether the server acts as a TURN-style relay when a direct hole can't be opened.</summary>
+        public bool RelayEnabled { get; set; } = true;
     }
 
     public class GameLogicSettings

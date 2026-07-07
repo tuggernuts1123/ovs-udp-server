@@ -4,6 +4,7 @@ using OVS.Rollback.Common;
 using OVS.Rollback.Configuration;
 using OVS.Rollback.Core;
 using OVS.Rollback.Models;
+using OVS.Rollback.P2P;
 using OVS.Rollback.Utils;
 using System;
 using System.Collections.Concurrent;
@@ -40,6 +41,11 @@ namespace OVS.Rollback.Core
         private readonly SemaphoreSlim _matchCreationLock = new(1, 1);
         private OVSMatchConfig? matchConfig = default;
         private ConcurrentBag<string> connections = new();
+
+        // P2P hole-punching coordinator. Null unless P2P.Enabled in config.
+        // When present it intercepts magic-prefixed control packets on the same
+        // UDP socket; game rollback traffic is never touched by it.
+        private readonly P2PCoordinator? _p2p;
 
         // ── Lifecycle ──
         private volatile bool _running;
@@ -90,6 +96,79 @@ namespace OVS.Rollback.Core
 
             string serverType = IsOVS ? "OVS" : (IsMVSI ? "MVSI" : "Unknown");
             Log.ServerStarted(_logger, serverType, _port);
+
+            // ── Optional P2P hole-punching coordinator ──
+            // Only constructed when explicitly enabled. Individual matches still
+            // have to opt in via their config's p2p_mode, so enabling the master
+            // switch alone changes nothing for classic dedicated-server matches.
+            var p2pCfg = ServerConfiguration.Instance.P2P;
+            if (p2pCfg.Enabled)
+            {
+                var settings = new P2PSettings(
+                    Enabled: p2pCfg.Enabled,
+                    RegistrationTimeoutMs: p2pCfg.RegistrationTimeoutMs,
+                    PunchWindowMs: p2pCfg.PunchWindowMs,
+                    PunchAttempts: p2pCfg.PunchAttempts,
+                    PunchIntervalMs: p2pCfg.PunchIntervalMs,
+                    PunchStartDelayMs: p2pCfg.PunchStartDelayMs,
+                    PeerLivenessTimeoutMs: p2pCfg.PeerLivenessTimeoutMs,
+                    RelayEnabled: p2pCfg.RelayEnabled);
+                _p2p = new P2PCoordinator(SendRawTo, ResolveP2PMatchInfo, settings, _logger);
+                _logger.LogInformation(
+                    "[P2P] Coordinator enabled (attempts={Attempts}, interval={Interval}ms, relay={Relay})",
+                    p2pCfg.PunchAttempts, p2pCfg.PunchIntervalMs, p2pCfg.RelayEnabled);
+            }
+        }
+
+        // ═══════════════════════════════════════════
+        //  P2P coordination glue
+        // ═══════════════════════════════════════════
+
+        /// <summary>Send a raw (uncompressed) datagram — used only for P2P control packets.</summary>
+        private void SendRawTo(byte[] data, IPEndPoint ep)
+        {
+            lock (_sendLock)
+            {
+                try
+                {
+                    _socket.SendTo(data, 0, data.Length, SocketFlags.None, ep);
+                }
+                catch (SocketException)
+                {
+                    // Peer endpoint unreachable; the coordinator's liveness sweep
+                    // will eventually drop it. Control packets are best-effort.
+                }
+            }
+        }
+
+        /// <summary>
+        /// Resolve a match's P2P parameters for the coordinator. Called on each
+        /// player's first control-channel registration (a handful of times per
+        /// match), so a synchronous config fetch here is acceptable.
+        /// </summary>
+        private P2PMatchInfo? ResolveP2PMatchInfo(string matchId, string key)
+        {
+            OVSMatchConfig? cfg;
+            try
+            {
+                cfg = _httpHelper.FetchMatchConfigAsync(matchId, key).GetAwaiter().GetResult();
+            }
+            catch
+            {
+                return null;
+            }
+            if (cfg is null) return null;
+
+            var hostByIndex = new Dictionary<ushort, bool>();
+            foreach (var p in cfg.Players)
+            {
+                // Only human, team-side players punch. Spectators and bots have
+                // no ASI on a home NAT to open a hole.
+                if (p.IsSpectator || p.PlayerIndex >= 8888 || p.IsBot) continue;
+                hostByIndex[p.PlayerIndex] = p.IsHost;
+            }
+            int expectedPeers = Math.Max(0, cfg.ActualPlayers - cfg.NumBots);
+            return new P2PMatchInfo(cfg.P2PMode, expectedPeers, hostByIndex);
         }
 
         public void Start()
@@ -153,6 +232,7 @@ namespace OVS.Rollback.Core
         public async ValueTask DisposeAsync()
         {
             await StopAsync();
+            _p2p?.Dispose();
             _socket.Dispose();
             _httpClient.Dispose();
             _matchCreationLock.Dispose();
@@ -204,6 +284,21 @@ namespace OVS.Rollback.Core
 
         private void HandleMessage(byte[] buffer, int length, IPEndPoint remote)
         {
+            // ── P2P control-channel intercept ──
+            // Control packets are magic-prefixed and uncompressed, so we detect
+            // them before any game decompression. Game rollback traffic never
+            // matches the magic and continues down the normal path untouched;
+            // this is a 4-byte compare on the cold connection path.
+            if (_p2p is not null && P2PControl.IsControlPacket(buffer.AsSpan(0, length)))
+            {
+                var control = P2PControl.Parse(buffer.AsSpan(0, length));
+                if (control.HasValue)
+                {
+                    _p2p.HandleControl(control.Value, remote);
+                }
+                return;
+            }
+
             var config = ServerConfiguration.Instance;
 
 
@@ -1050,6 +1145,7 @@ namespace OVS.Rollback.Core
                     match.Players.Clear();
                     foreach (var inputMap in match.Inputs) inputMap.Clear();
                     _matches.TryRemove(match.MatchId, out _);
+                    _p2p?.EndMatch(match.MatchId);
                     ServerMetrics.MatchesEnded.Add(1);
                     Log.MatchCleanedUp(_logger, match.MatchId);
                     _ = Events.SendMatchEndEvent(this, StatusEventArgs.CreateNew(
