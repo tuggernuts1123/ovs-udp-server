@@ -48,12 +48,21 @@ namespace OVS.Rollback.Models
         //   2 = Forced (direct only; no relay)
         // Absent in legacy configs → defaults to Off, so nothing changes unless
         // the backend explicitly opts a match in.
+        //
+        // Typed as int (not byte) and tolerant of stringly-typed numbers so a
+        // malformed p2p_mode degrades to Off instead of throwing during config
+        // deserialization — a throw here would abort the ENTIRE match, not just
+        // disable P2P.
         [JsonPropertyName("p2p_mode")]
-        public byte P2PModeRaw { get; set; } = 0;
+        [System.Text.Json.Serialization.JsonNumberHandling(
+            System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString)]
+        public int P2PModeRaw { get; set; } = 0;
 
         [JsonIgnore]
         public P2P.P2PMode P2PMode =>
-            Enum.IsDefined(typeof(P2P.P2PMode), P2PModeRaw) ? (P2P.P2PMode)P2PModeRaw : P2P.P2PMode.Off;
+            Enum.IsDefined(typeof(P2P.P2PMode), (byte)(P2PModeRaw & 0xFF)) && P2PModeRaw is >= 0 and <= 2
+                ? (P2P.P2PMode)P2PModeRaw
+                : P2P.P2PMode.Off;
 
         public int NumSpectators
         {

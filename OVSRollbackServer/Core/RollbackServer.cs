@@ -113,7 +113,7 @@ namespace OVS.Rollback.Core
                     PunchStartDelayMs: p2pCfg.PunchStartDelayMs,
                     PeerLivenessTimeoutMs: p2pCfg.PeerLivenessTimeoutMs,
                     RelayEnabled: p2pCfg.RelayEnabled);
-                _p2p = new P2PCoordinator(SendRawTo, ResolveP2PMatchInfo, settings, _logger);
+                _p2p = new P2PCoordinator(SendRawTo, settings, _logger);
                 _logger.LogInformation(
                     "[P2P] Coordinator enabled (attempts={Attempts}, interval={Interval}ms, relay={Relay})",
                     p2pCfg.PunchAttempts, p2pCfg.PunchIntervalMs, p2pCfg.RelayEnabled);
@@ -142,32 +142,27 @@ namespace OVS.Rollback.Core
         }
 
         /// <summary>
-        /// Resolve a match's P2P parameters for the coordinator. Called on each
-        /// player's first control-channel registration (a handful of times per
-        /// match), so a synchronous config fetch here is acceptable.
+        /// Build a match's P2P parameters from an ALREADY-FETCHED config. Called
+        /// from HandleNewConnection under the match-creation lock, so no network
+        /// I/O ever touches the UDP receive loop. Returns null if the match isn't
+        /// opted into P2P.
         /// </summary>
-        private P2PMatchInfo? ResolveP2PMatchInfo(string matchId, string key)
+        private static P2PMatchInfo? BuildP2PMatchInfo(OVSMatchConfig cfg)
         {
-            OVSMatchConfig? cfg;
-            try
-            {
-                cfg = _httpHelper.FetchMatchConfigAsync(matchId, key).GetAwaiter().GetResult();
-            }
-            catch
-            {
-                return null;
-            }
-            if (cfg is null) return null;
+            if (cfg.P2PMode == P2PMode.Off) return null;
 
             var hostByIndex = new Dictionary<ushort, bool>();
+            int expectedPeers = 0;
             foreach (var p in cfg.Players)
             {
                 // Only human, team-side players punch. Spectators and bots have
-                // no ASI on a home NAT to open a hole.
+                // no ASI on a home NAT to open a hole. Count from this exact
+                // predicate (not ActualPlayers - NumBots, which double-subtracts
+                // any player flagged both spectator and bot).
                 if (p.IsSpectator || p.PlayerIndex >= 8888 || p.IsBot) continue;
                 hostByIndex[p.PlayerIndex] = p.IsHost;
+                expectedPeers++;
             }
-            int expectedPeers = Math.Max(0, cfg.ActualPlayers - cfg.NumBots);
             return new P2PMatchInfo(cfg.P2PMode, expectedPeers, hostByIndex);
         }
 
@@ -559,6 +554,16 @@ namespace OVS.Rollback.Core
                     );
 
                     matchConfig = config; // Store in server-level cache for quick access during player joins
+
+                    // Feed the P2P coordinator now, off the receive-control path,
+                    // using the config we just fetched. No-op if the match isn't
+                    // opted into P2P or the coordinator is disabled.
+                    if (_p2p is not null)
+                    {
+                        var p2pInfo = BuildP2PMatchInfo(config);
+                        if (p2pInfo is not null)
+                            _p2p.EnableMatch(matchData.MatchId, p2pInfo);
+                    }
                 }
             }
             finally { _matchCreationLock.Release(); }

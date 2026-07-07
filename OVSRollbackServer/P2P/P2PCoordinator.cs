@@ -4,13 +4,19 @@
 // lives on the rollback server and manages a coordination session per match.
 //
 // Flow (see docs/P2P_HOLE_PUNCHING.md for the full picture):
+//   0. The rollback server calls EnableMatch(matchId, info) when it creates a
+//      match (it already has the fetched config in hand). This is the ONLY
+//      place match config enters the coordinator — the UDP receive/control path
+//      never performs a blocking config fetch, so it cannot stall the
+//      frame-authoritative hot path.
 //   1. Each match player's ASI sends a Register control packet. The server
-//      records the reflexive (public) endpoint it observed and, on the first
-//      registration for a match, looks up the match's P2P config.
+//      records the reflexive (public) endpoint it observed. Registrations that
+//      arrive before EnableMatch are briefly buffered and drained once the
+//      match is enabled.
 //   2. Once every expected participant has registered (or a short timeout
 //      elapses with at least two present), the coordinator elects a host,
 //      broadcasts the full PeerList, and issues a synchronized PunchNow so all
-//      clients fire UDP punches at each other at the same moment.
+//      clients fire UDP punches at the same moment.
 //   3. Clients report PunchResult per peer. When BOTH directions of a pair are
 //      confirmed, the coordinator tells each side to route that peer Directly.
 //      Pairs still unconfirmed when the punch window closes are told to route
@@ -69,6 +75,10 @@ namespace OVS.Rollback.P2P
             public P2PSessionPhase Phase = P2PSessionPhase.Registering;
             public long CreatedTs;
             public long PunchStartedTs;
+            // Bumped on every inbound control packet for this session. The
+            // eviction sweep captures it and only removes if it hasn't changed,
+            // closing the "evict a peer that just refreshed" race.
+            public long LastActivityTs;
             public ushort HostIndex;
             public bool HostResolved;
             public readonly object Gate = new();
@@ -77,12 +87,15 @@ namespace OVS.Rollback.P2P
         }
 
         private readonly ConcurrentDictionary<string, Session> _sessions = new();
+        // Per-match config, populated by EnableMatch (off the receive path).
+        private readonly ConcurrentDictionary<string, P2PMatchInfo> _matchInfo = new();
+        // Registrations that arrived before EnableMatch; drained when it fires.
+        private readonly ConcurrentDictionary<string, ConcurrentDictionary<ushort, IPEndPoint>> _pending = new();
         // Maps a live reflexive endpoint back to (matchId, playerIndex) so packets
         // that don't carry a matchId (PunchResult/KeepAlive/RelayData) can be routed.
         private readonly ConcurrentDictionary<string, (string matchId, ushort index)> _endpointOwners = new();
 
         private readonly Action<byte[], IPEndPoint> _send;
-        private readonly Func<string, string, P2PMatchInfo?> _matchInfoProvider;
         private readonly ILogger _logger;
         private readonly P2PSettings _settings;
         private readonly Timer _sweepTimer;
@@ -90,16 +103,37 @@ namespace OVS.Rollback.P2P
 
         public P2PCoordinator(
             Action<byte[], IPEndPoint> send,
-            Func<string, string, P2PMatchInfo?> matchInfoProvider,
             P2PSettings settings,
             ILogger logger)
         {
             _send = send;
-            _matchInfoProvider = matchInfoProvider;
             _settings = settings;
             _logger = logger;
             // Sweep drives the registration/punch timeouts and liveness eviction.
             _sweepTimer = new Timer(_ => SafeSweep(), null, 500, 500);
+        }
+
+        // ═══════════════════════════════════════════
+        //  Match enablement (called off the receive path)
+        // ═══════════════════════════════════════════
+
+        /// <summary>
+        /// Register a match's P2P parameters. Called by the rollback server when
+        /// it creates the match (config already fetched), never from the UDP
+        /// receive loop. Idempotent. Drains any registrations that raced ahead.
+        /// </summary>
+        public void EnableMatch(string matchId, P2PMatchInfo info)
+        {
+            if (!_settings.Enabled || info.Mode == P2PMode.Off) return;
+
+            _matchInfo[matchId] = info;
+
+            // Drain early registrations that arrived before this call.
+            if (_pending.TryRemove(matchId, out var early))
+            {
+                foreach (var kv in early)
+                    IngestRegistration(matchId, kv.Key, kv.Value);
+            }
         }
 
         // ═══════════════════════════════════════════
@@ -122,46 +156,61 @@ namespace OVS.Rollback.P2P
 
         private void HandleRegister(in P2PInbound msg, IPEndPoint remote)
         {
-            // Copy out of the 'in' struct so the values can be captured by the
-            // concurrent-dictionary lambdas below (CS1628 otherwise).
             string matchId = msg.MatchId;
-            string key = msg.Key;
             ushort playerIndex = msg.PlayerIndex;
+            var endpoint = new IPEndPoint(remote.Address, remote.Port);
 
-            var info = _matchInfoProvider(matchId, key);
-            if (info is null || info.Mode == P2PMode.Off)
+            // If the match hasn't been enabled yet (Register raced ahead of match
+            // creation), buffer the endpoint and return. NO config fetch happens
+            // here — the receive loop must never block on the network.
+            if (!_matchInfo.ContainsKey(matchId))
             {
-                // Backend didn't enable P2P for this match; ignore silently so
-                // an over-eager client can't spin up coordination state.
+                var bucket = _pending.GetOrAdd(matchId, _ => new ConcurrentDictionary<ushort, IPEndPoint>());
+                bucket[playerIndex] = endpoint;
                 return;
             }
+
+            IngestRegistration(matchId, playerIndex, endpoint);
+        }
+
+        private void IngestRegistration(string matchId, ushort playerIndex, IPEndPoint endpoint)
+        {
+            if (!_matchInfo.TryGetValue(matchId, out var info) || info.Mode == P2PMode.Off)
+                return;
 
             var session = _sessions.GetOrAdd(matchId, id => new Session
             {
                 MatchId = id,
-                Key = key,
+                Key = string.Empty,
                 Mode = info.Mode,
                 ExpectedPeers = info.ExpectedPeers,
                 HostByIndex = info.HostByIndex,
                 CreatedTs = Stopwatch.GetTimestamp(),
+                LastActivityTs = Stopwatch.GetTimestamp(),
             });
 
             long now = Stopwatch.GetTimestamp();
-            var endpoint = new IPEndPoint(remote.Address, remote.Port);
+            session.LastActivityTs = now;
 
+            IPEndPoint? oldEp = null;
             var peer = session.Peers.AddOrUpdate(playerIndex,
                 _ => new P2PPeer(playerIndex, endpoint, now),
                 (_, existing) =>
                 {
+                    if (!existing.ReflexiveEndpoint.Equals(endpoint))
+                        oldEp = existing.ReflexiveEndpoint;
                     existing.ReflexiveEndpoint = endpoint;
                     existing.LastSeenTimestamp = now;
                     return existing;
                 });
 
+            // Retire the previous endpoint mapping so _endpointOwners can't leak
+            // stale keys (and can't misroute a later, reused address) when a peer
+            // re-registers from a rebound NAT port.
+            if (oldEp is not null)
+                RemoveOwnerIf(oldEp, matchId, playerIndex);
             _endpointOwners[EndpointKey(endpoint)] = (matchId, playerIndex);
 
-            // Immediately echo the reflexive endpoint so the client learns its
-            // own public IP:port (STUN behaviour) and its assigned role.
             var role = ResolveRole(session, playerIndex);
             peer.Role = role;
             _send(P2PControl.BuildRegisterAck(role, session.Mode, endpoint), endpoint);
@@ -179,7 +228,9 @@ namespace OVS.Rollback.P2P
             if (!_sessions.TryGetValue(owner.matchId, out var session)) return;
             if (!session.Peers.TryGetValue(owner.index, out var peer)) return;
 
-            peer.LastSeenTimestamp = Stopwatch.GetTimestamp();
+            long now = Stopwatch.GetTimestamp();
+            peer.LastSeenTimestamp = now;
+            session.LastActivityTs = now;
             peer.PunchConfirmed[msg.PeerIndex] = msg.Success;
 
             if (msg.Success)
@@ -194,10 +245,18 @@ namespace OVS.Rollback.P2P
             if (!_settings.RelayEnabled) return;
             if (!_endpointOwners.TryGetValue(EndpointKey(remote), out var owner)) return;
             if (!_sessions.TryGetValue(owner.matchId, out var session)) return;
+
+            // Forced-P2P means direct-only: the server must not act as a TURN
+            // relay even if a client asks it to. This mirrors FailPairToRelay's
+            // control-path guard so Forced is enforced on the data path too.
+            if (session.Mode == P2PMode.Forced) return;
+
             if (!session.Peers.TryGetValue(msg.DstPlayerIndex, out var dst)) return;
 
+            session.LastActivityTs = Stopwatch.GetTimestamp();
+
             // Forward opaque (already game-compressed) bytes to the destination
-            // peer, tagged with the source index so the receiver can attribute it.
+            // peer, tagged with the (authenticated, endpoint-derived) source index.
             var packet = P2PControl.BuildRelayDeliver(owner.index, msg.Data.Span);
             _send(packet, dst.ReflexiveEndpoint);
         }
@@ -206,17 +265,22 @@ namespace OVS.Rollback.P2P
         {
             if (!_endpointOwners.TryGetValue(EndpointKey(remote), out var owner))
             {
-                // Endpoint rebind (NAT changed the mapping). We can't safely
-                // re-associate without a matchId, so wait for a fresh Register.
+                // Endpoint rebind we haven't been told about via Register. We
+                // can't safely re-associate without a matchId, so wait for a
+                // fresh Register (the client contract retransmits it).
                 return;
             }
             if (!_sessions.TryGetValue(owner.matchId, out var session)) return;
             if (session.Peers.TryGetValue(owner.index, out var peer))
             {
-                peer.LastSeenTimestamp = Stopwatch.GetTimestamp();
+                long now = Stopwatch.GetTimestamp();
+                peer.LastSeenTimestamp = now;
+                session.LastActivityTs = now;
                 if (!peer.ReflexiveEndpoint.Equals(remote))
                 {
+                    var oldEp = peer.ReflexiveEndpoint;
                     peer.ReflexiveEndpoint = new IPEndPoint(remote.Address, remote.Port);
+                    RemoveOwnerIf(oldEp, owner.matchId, owner.index);
                     _endpointOwners[EndpointKey(remote)] = owner;
                 }
             }
@@ -377,8 +441,6 @@ namespace OVS.Rollback.P2P
 
         private void Sweep()
         {
-            long now = Stopwatch.GetTimestamp();
-
             foreach (var session in _sessions.Values)
             {
                 lock (session.Gate)
@@ -424,23 +486,23 @@ namespace OVS.Rollback.P2P
                 }
             }
 
-            // Evict dead sessions (all peers gone silent). Coordination state is
-            // cheap but we don't want it to accumulate across a long-lived server.
+            // Evict dead sessions (all peers gone silent). Re-checked under the
+            // gate against LastActivityTs, which every inbound handler bumps, so
+            // a session that just saw a Register/KeepAlive is never torn down.
             foreach (var kv in _sessions)
             {
                 var session = kv.Value;
-                bool anyAlive = false;
-                foreach (var peer in session.Peers.Values)
+                lock (session.Gate)
                 {
-                    double idle = Stopwatch.GetElapsedTime(peer.LastSeenTimestamp).TotalMilliseconds;
-                    if (idle < _settings.PeerLivenessTimeoutMs) { anyAlive = true; break; }
-                }
-                if (!anyAlive && session.Peers.Count > 0)
-                {
+                    if (session.Peers.Count == 0) continue;
+                    double idle = Stopwatch.GetElapsedTime(session.LastActivityTs).TotalMilliseconds;
+                    if (idle < _settings.PeerLivenessTimeoutMs) continue;
+
                     if (_sessions.TryRemove(kv.Key, out _))
                     {
-                        foreach (var peer in session.Peers.Values)
-                            _endpointOwners.TryRemove(EndpointKey(peer.ReflexiveEndpoint), out _);
+                        PurgeOwnersForMatch(kv.Key);
+                        _matchInfo.TryRemove(kv.Key, out _);
+                        _pending.TryRemove(kv.Key, out _);
                         _logger.LogInformation("[P2P] Evicted idle session match={Match}", session.MatchId);
                     }
                 }
@@ -450,11 +512,10 @@ namespace OVS.Rollback.P2P
         /// <summary>Drop a match's coordination state (called when the authority match ends).</summary>
         public void EndMatch(string matchId)
         {
-            if (_sessions.TryRemove(matchId, out var session))
-            {
-                foreach (var peer in session.Peers.Values)
-                    _endpointOwners.TryRemove(EndpointKey(peer.ReflexiveEndpoint), out _);
-            }
+            _sessions.TryRemove(matchId, out _);
+            _matchInfo.TryRemove(matchId, out _);
+            _pending.TryRemove(matchId, out _);
+            PurgeOwnersForMatch(matchId);
         }
 
         // ═══════════════════════════════════════════
@@ -464,12 +525,39 @@ namespace OVS.Rollback.P2P
         private static string EndpointKey(IPEndPoint ep) => $"{ep.Address}:{ep.Port}";
         private static (ushort, ushort) PairKey(ushort a, ushort b) => a < b ? (a, b) : (b, a);
 
+        /// <summary>Remove an endpoint→owner mapping only if it still points at the given owner.</summary>
+        private void RemoveOwnerIf(IPEndPoint ep, string matchId, ushort index)
+        {
+            var key = EndpointKey(ep);
+            if (_endpointOwners.TryGetValue(key, out var cur) && cur.matchId == matchId && cur.index == index)
+            {
+                // Guard against racing a legitimate re-use: only remove the exact pair.
+                ((ICollection<KeyValuePair<string, (string matchId, ushort index)>>)_endpointOwners)
+                    .Remove(new KeyValuePair<string, (string, ushort)>(key, cur));
+            }
+        }
+
+        /// <summary>Purge every endpoint mapping belonging to a match (used on eviction/EndMatch).</summary>
+        private void PurgeOwnersForMatch(string matchId)
+        {
+            foreach (var kv in _endpointOwners)
+            {
+                if (kv.Value.matchId == matchId)
+                {
+                    ((ICollection<KeyValuePair<string, (string matchId, ushort index)>>)_endpointOwners)
+                        .Remove(kv);
+                }
+            }
+        }
+
         public void Dispose()
         {
             _disposed = true;
             _sweepTimer.Dispose();
             _sessions.Clear();
             _endpointOwners.Clear();
+            _matchInfo.Clear();
+            _pending.Clear();
         }
     }
 }

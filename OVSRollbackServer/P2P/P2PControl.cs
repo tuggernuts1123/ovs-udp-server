@@ -103,6 +103,7 @@ namespace OVS.Rollback.P2P
                     {
                         ushort idx = ReadU16(buffer, ref o);
                         ushort peer = ReadU16(buffer, ref o);
+                        if (o >= buffer.Length) return null;
                         byte ok = buffer[o++];
                         return new P2PInbound { Subtype = subtype, PlayerIndex = idx, PeerIndex = peer, Success = ok != 0 };
                     }
@@ -124,8 +125,12 @@ namespace OVS.Rollback.P2P
                         return null; // server→client subtype received on the server; ignore
                 }
             }
-            catch (ArgumentOutOfRangeException)
+            catch (Exception e) when (e is ArgumentOutOfRangeException or IndexOutOfRangeException)
             {
+                // Any truncation-driven read failure → treat as malformed and
+                // drop, honouring the "returns null if malformed" contract. Raw
+                // span indexing throws IndexOutOfRangeException (a sibling type
+                // of ArgumentOutOfRangeException), so both must be caught.
                 return null;
             }
         }
@@ -239,6 +244,7 @@ namespace OVS.Rollback.P2P
 
         private static string ReadStr8(ReadOnlySpan<byte> buf, ref int o)
         {
+            if (o >= buf.Length) throw new ArgumentOutOfRangeException(nameof(o));
             byte len = buf[o++];
             if (o + len > buf.Length) throw new ArgumentOutOfRangeException(nameof(len));
             var s = Encoding.ASCII.GetString(buf.Slice(o, len));
