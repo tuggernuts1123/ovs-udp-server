@@ -47,6 +47,11 @@ namespace OVS.Rollback.Core
         // UDP socket; game rollback traffic is never touched by it.
         private readonly P2PCoordinator? _p2p;
 
+        // P2P clients — one per match this exe participates in as a local host/
+        // guest (registers with the cloud coordinator + punches peers). Keyed by
+        // matchId. Empty on the cloud coordinator itself.
+        private readonly ConcurrentDictionary<string, P2PClient> _p2pClients = new();
+
         // ── Lifecycle ──
         private volatile bool _running;
         private Task? _udpTask;
@@ -104,16 +109,7 @@ namespace OVS.Rollback.Core
             var p2pCfg = ServerConfiguration.Instance.P2P;
             if (p2pCfg.Enabled)
             {
-                var settings = new P2PSettings(
-                    Enabled: p2pCfg.Enabled,
-                    RegistrationTimeoutMs: p2pCfg.RegistrationTimeoutMs,
-                    PunchWindowMs: p2pCfg.PunchWindowMs,
-                    PunchAttempts: p2pCfg.PunchAttempts,
-                    PunchIntervalMs: p2pCfg.PunchIntervalMs,
-                    PunchStartDelayMs: p2pCfg.PunchStartDelayMs,
-                    PeerLivenessTimeoutMs: p2pCfg.PeerLivenessTimeoutMs,
-                    RelayEnabled: p2pCfg.RelayEnabled);
-                _p2p = new P2PCoordinator(SendRawTo, settings, _logger);
+                _p2p = new P2PCoordinator(SendRawTo, BuildP2PSettings(), _logger);
                 _logger.LogInformation(
                     "[P2P] Coordinator enabled (attempts={Attempts}, interval={Interval}ms, relay={Relay})",
                     p2pCfg.PunchAttempts, p2pCfg.PunchIntervalMs, p2pCfg.RelayEnabled);
@@ -123,6 +119,57 @@ namespace OVS.Rollback.Core
         // ═══════════════════════════════════════════
         //  P2P coordination glue
         // ═══════════════════════════════════════════
+
+        /// <summary>Build the coordinator/client settings tuple from live config.</summary>
+        private static P2PSettings BuildP2PSettings()
+        {
+            var c = ServerConfiguration.Instance.P2P;
+            return new P2PSettings(
+                Enabled: c.Enabled,
+                RegistrationTimeoutMs: c.RegistrationTimeoutMs,
+                PunchWindowMs: c.PunchWindowMs,
+                PunchAttempts: c.PunchAttempts,
+                PunchIntervalMs: c.PunchIntervalMs,
+                PunchStartDelayMs: c.PunchStartDelayMs,
+                PeerLivenessTimeoutMs: c.PeerLivenessTimeoutMs,
+                RelayEnabled: c.RelayEnabled);
+        }
+
+        /// <summary>
+        /// Start a P2P client for a match when the LOCAL game (loopback) connects
+        /// and the match is P2P with a coordinator. The client registers with the
+        /// cloud coordinator and punches peers; the host also runs the authority
+        /// tick loop. Idempotent per match; only the local game triggers it.
+        /// </summary>
+        private void MaybeStartP2PClient(OVSMatchConfig? cfg, string matchId, string key, ushort localPlayerIndex, IPEndPoint remote)
+        {
+            if (cfg is null || cfg.P2PMode == P2PMode.Off) return;
+            if (!IPAddress.IsLoopback(remote.Address)) return;
+            if (string.IsNullOrWhiteSpace(cfg.Coordinator)) return;
+            if (localPlayerIndex >= 8888) return; // spectators don't punch
+            if (_p2pClients.ContainsKey(matchId)) return;
+
+            var coordEp = TryParseEndpoint(cfg.Coordinator);
+            if (coordEp is null)
+            {
+                _logger.LogWarning("[P2P] Match {Match} has an unparseable coordinator '{Coord}'; staying on authority.",
+                    matchId, cfg.Coordinator);
+                return;
+            }
+
+            var client = new P2PClient(SendRawTo, coordEp, matchId, key, localPlayerIndex, BuildP2PSettings(), _logger);
+            if (_p2pClients.TryAdd(matchId, client))
+            {
+                client.Start();
+                _logger.LogInformation(
+                    "[P2P] Local P2P client started for match {Match} as player {Idx} → coordinator {Coord}",
+                    matchId, localPlayerIndex, coordEp);
+            }
+            else
+            {
+                client.Dispose();
+            }
+        }
 
         /// <summary>Send a raw (uncompressed) datagram — used only for P2P control packets.</summary>
         private void SendRawTo(byte[] data, IPEndPoint ep)
@@ -344,6 +391,8 @@ namespace OVS.Rollback.Core
         public async ValueTask DisposeAsync()
         {
             await StopAsync();
+            foreach (var client in _p2pClients.Values) client.Dispose();
+            _p2pClients.Clear();
             _p2p?.Dispose();
             _socket.Dispose();
             _httpClient.Dispose();
@@ -401,13 +450,19 @@ namespace OVS.Rollback.Core
             // them before any game decompression. Game rollback traffic never
             // matches the magic and continues down the normal path untouched;
             // this is a 4-byte compare on the cold connection path.
-            if (_p2p is not null && P2PControl.IsControlPacket(buffer.AsSpan(0, length)))
+            if ((_p2p is not null || !_p2pClients.IsEmpty) && P2PControl.IsControlPacket(buffer.AsSpan(0, length)))
             {
-                var control = P2PControl.Parse(buffer.AsSpan(0, length));
-                if (control.HasValue)
+                // Coordinator role (cloud): handle client→server control packets.
+                if (_p2p is not null)
                 {
-                    _p2p.HandleControl(control.Value, remote);
+                    var control = P2PControl.Parse(buffer.AsSpan(0, length));
+                    if (control.HasValue) _p2p.HandleControl(control.Value, remote);
                 }
+                // Client role (local host/guest): feed server→client + peer Punch
+                // packets to the active P2P client(s). Each ignores packets not
+                // meant for it, so feeding all is safe.
+                foreach (var client in _p2pClients.Values)
+                    client.HandleDatagram(buffer.AsSpan(0, length), remote);
                 return;
             }
 
@@ -763,6 +818,11 @@ namespace OVS.Rollback.Core
             match.Players[key] = newPlayer;
             _players[key] = newPlayer;
             ServerMetrics.PlayersConnected.Add(1);
+
+            // If the LOCAL game (loopback) just connected to a P2P match, spin up
+            // this machine's P2P client (register with the coordinator + punch).
+            MaybeStartP2PClient(matchConfig, matchData.MatchId, matchData.Key, payloadIndex, remote);
+
             Log.PlayerJoined(_logger, payload.PlayerData.PlayerIndex, newPlayer.PlayerId, newPlayer.PlayerName, newPlayer.PlayerCharacter, matchData.MatchId);
             _ = Events.SendPlayerConnectEvent(this, StatusEventArgs.CreateNew(
                     description: "PlayerConnect",
@@ -1268,6 +1328,7 @@ namespace OVS.Rollback.Core
                     foreach (var inputMap in match.Inputs) inputMap.Clear();
                     _matches.TryRemove(match.MatchId, out _);
                     _p2p?.EndMatch(match.MatchId);
+                    if (_p2pClients.TryRemove(match.MatchId, out var endedClient)) endedClient.Dispose();
                     ServerMetrics.MatchesEnded.Add(1);
                     Log.MatchCleanedUp(_logger, match.MatchId);
                     _ = Events.SendMatchEndEvent(this, StatusEventArgs.CreateNew(

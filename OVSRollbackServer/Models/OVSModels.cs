@@ -87,6 +87,12 @@ namespace OVS.Rollback.Models
         [JsonConverter(typeof(TolerantIntConverter))]
         public int P2PModeRaw { get; set; } = 0;
 
+        // Rendezvous/coordinator endpoint ("ip:port") the local exes register
+        // with for hole punching — the cloud rollback server for this match.
+        // Empty when not a P2P match.
+        [JsonPropertyName("coordinator")]
+        public string Coordinator { get; set; } = string.Empty;
+
         [JsonIgnore]
         public P2P.P2PMode P2PMode =>
             Enum.IsDefined(typeof(P2P.P2PMode), (byte)(P2PModeRaw & 0xFF)) && P2PModeRaw is >= 0 and <= 2
