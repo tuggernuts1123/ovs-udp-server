@@ -38,6 +38,9 @@ namespace OVS.Rollback.P2P
         RelayData = 0x03,     // TURN: opaque bytes to be forwarded to a destination peer
         KeepAlive = 0x04,     // refresh NAT binding + liveness
 
+        // ── Peer → Peer (direct, not via the coordinator) ──
+        Punch = 0x05,         // NAT-opening probe sent straight to a peer's reflexive endpoint; carries sender index
+
         // ── Server → Client ──
         RegisterAck = 0x81,   // reflexive endpoint echo + assigned role + mode
         PeerList = 0x82,      // every peer's reflexive endpoint + role
@@ -118,6 +121,12 @@ namespace OVS.Rollback.P2P
                     }
                     case P2PSubtype.KeepAlive:
                     {
+                        ushort idx = ReadU16(buffer, ref o);
+                        return new P2PInbound { Subtype = subtype, PlayerIndex = idx };
+                    }
+                    case P2PSubtype.Punch:
+                    {
+                        // Peer→peer NAT probe: PlayerIndex carries the SENDER's index.
                         ushort idx = ReadU16(buffer, ref o);
                         return new P2PInbound { Subtype = subtype, PlayerIndex = idx };
                     }
@@ -297,6 +306,39 @@ namespace OVS.Rollback.P2P
             buf[o++] = (byte)ipBytes.Length;
             ipBytes.CopyTo(buf, o); o += ipBytes.Length;
             WriteU16(buf, ref o, (ushort)ep.Port);
+            return buf;
+        }
+
+        /// <summary>Client→server Register (announce presence + match). Mirrors the Register case of Parse().</summary>
+        public static byte[] BuildRegister(ushort playerIndex, string matchId, string key)
+        {
+            var mid = Encoding.ASCII.GetBytes(matchId ?? string.Empty);
+            var k = Encoding.ASCII.GetBytes(key ?? string.Empty);
+            var buf = new byte[HeaderSize + 2 + 1 + mid.Length + 1 + k.Length];
+            int o = WriteHeader(buf, P2PSubtype.Register);
+            WriteU16(buf, ref o, playerIndex);
+            buf[o++] = (byte)mid.Length; mid.CopyTo(buf, o); o += mid.Length;
+            buf[o++] = (byte)k.Length; k.CopyTo(buf, o); o += k.Length;
+            return buf;
+        }
+
+        /// <summary>Client→server PunchResult. Mirrors the PunchResult case of Parse().</summary>
+        public static byte[] BuildPunchResult(ushort playerIndex, ushort peerIndex, bool success)
+        {
+            var buf = new byte[HeaderSize + 2 + 2 + 1];
+            int o = WriteHeader(buf, P2PSubtype.PunchResult);
+            WriteU16(buf, ref o, playerIndex);
+            WriteU16(buf, ref o, peerIndex);
+            buf[o++] = (byte)(success ? 1 : 0);
+            return buf;
+        }
+
+        /// <summary>Peer→peer NAT-opening probe sent to a peer's reflexive endpoint. Carries the sender's index.</summary>
+        public static byte[] BuildPunch(ushort senderIndex)
+        {
+            var buf = new byte[HeaderSize + 2];
+            int o = WriteHeader(buf, P2PSubtype.Punch);
+            WriteU16(buf, ref o, senderIndex);
             return buf;
         }
 
