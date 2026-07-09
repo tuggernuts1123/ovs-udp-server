@@ -52,6 +52,16 @@ namespace OVS.Rollback.Core
         // matchId. Empty on the cloud coordinator itself.
         private readonly ConcurrentDictionary<string, P2PClient> _p2pClients = new();
 
+        // Guest-proxy state: when this machine is a GUEST for a P2P match, its
+        // game (loopback) is bridged to the host instead of running the authority
+        // loop. One active guest session at a time (per game session).
+        private volatile bool _guestMode;
+        private P2PClient? _guestClient;
+        private string? _guestMatchId;
+        private volatile IPEndPoint? _guestLocalGame;
+        private long _guestLastActivityTs;
+        private Timer? _guestIdleTimer;
+
         // ── Lifecycle ──
         private volatile bool _running;
         private Task? _udpTask;
@@ -141,20 +151,20 @@ namespace OVS.Rollback.Core
         /// cloud coordinator and punches peers; the host also runs the authority
         /// tick loop. Idempotent per match; only the local game triggers it.
         /// </summary>
-        private void MaybeStartP2PClient(OVSMatchConfig? cfg, string matchId, string key, ushort localPlayerIndex, IPEndPoint remote)
+        private P2PClient? MaybeStartP2PClient(OVSMatchConfig? cfg, string matchId, string key, ushort localPlayerIndex, IPEndPoint remote)
         {
-            if (cfg is null || cfg.P2PMode == P2PMode.Off) return;
-            if (!IPAddress.IsLoopback(remote.Address)) return;
-            if (string.IsNullOrWhiteSpace(cfg.Coordinator)) return;
-            if (localPlayerIndex >= 8888) return; // spectators don't punch
-            if (_p2pClients.ContainsKey(matchId)) return;
+            if (cfg is null || cfg.P2PMode == P2PMode.Off) return null;
+            if (!IPAddress.IsLoopback(remote.Address)) return null;
+            if (string.IsNullOrWhiteSpace(cfg.Coordinator)) return null;
+            if (localPlayerIndex >= 8888) return null; // spectators don't punch
+            if (_p2pClients.TryGetValue(matchId, out var existing)) return existing;
 
             var coordEp = TryParseEndpoint(cfg.Coordinator);
             if (coordEp is null)
             {
                 _logger.LogWarning("[P2P] Match {Match} has an unparseable coordinator '{Coord}'; staying on authority.",
                     matchId, cfg.Coordinator);
-                return;
+                return null;
             }
 
             var client = new P2PClient(SendRawTo, coordEp, matchId, key, localPlayerIndex, BuildP2PSettings(), _logger);
@@ -164,11 +174,66 @@ namespace OVS.Rollback.Core
                 _logger.LogInformation(
                     "[P2P] Local P2P client started for match {Match} as player {Idx} → coordinator {Coord}",
                     matchId, localPlayerIndex, coordEp);
+                return client;
             }
-            else
+            client.Dispose();
+            return _p2pClients.TryGetValue(matchId, out var raced) ? raced : null;
+        }
+
+        /// <summary>Returns true (and sets up guest proxying) if the local player is a GUEST for this P2P match.</summary>
+        private bool TryEnterGuestMode(OVSMatchConfig cfg, string matchId, string key, ushort localPlayerIndex, IPEndPoint localGame)
+        {
+            bool isHost = false;
+            foreach (var p in cfg.Players)
+                if (p.PlayerIndex == localPlayerIndex) { isHost = p.IsHost; break; }
+            if (isHost) return false;
+
+            var client = MaybeStartP2PClient(cfg, matchId, key, localPlayerIndex, localGame);
+            if (client is null) return false;
+
+            _guestClient = client;
+            _guestMatchId = matchId;
+            _guestLocalGame = localGame;
+            _guestLastActivityTs = Stopwatch.GetTimestamp();
+            _guestMode = true;
+            _guestIdleTimer ??= new Timer(_ => GuestIdleSweep(), null, 5000, 5000);
+            _logger.LogInformation("[P2P] This machine is a GUEST for match {Match} (player {Idx}); proxying game ↔ host.",
+                matchId, localPlayerIndex);
+            return true;
+        }
+
+        /// <summary>Bridge the local game (loopback) ↔ the resolved host endpoint. Called for non-control datagrams in guest mode.</summary>
+        private void HandleGuestDatagram(byte[] buffer, int length, IPEndPoint remote)
+        {
+            _guestLastActivityTs = Stopwatch.GetTimestamp();
+            var host = _guestClient?.HostEndpoint();
+
+            if (IPAddress.IsLoopback(remote.Address))
             {
-                client.Dispose();
+                _guestLocalGame = remote; // learn the game's ephemeral endpoint
+                if (host is not null) SendProxy(buffer, length, host);
+                // else: host not resolved yet — drop; the game retransmits.
+                return;
             }
+            if (host is not null && remote.Port == host.Port && remote.Address.Equals(host.Address))
+            {
+                var game = _guestLocalGame;
+                if (game is not null) SendProxy(buffer, length, game);
+            }
+            // else: stray source — ignore.
+        }
+
+        /// <summary>Clear guest mode after the game session goes idle (match over / next match).</summary>
+        private void GuestIdleSweep()
+        {
+            if (!_guestMode) return;
+            if (Stopwatch.GetElapsedTime(_guestLastActivityTs).TotalSeconds < 30) return;
+            _logger.LogInformation("[P2P] Guest session for match {Match} idle — clearing guest mode.", _guestMatchId);
+            if (_guestMatchId is not null && _p2pClients.TryRemove(_guestMatchId, out var c)) c.Dispose();
+            _guestMode = false;
+            _guestClient = null;
+            _guestMatchId = null;
+            _guestLocalGame = null;
         }
 
         /// <summary>Send a raw (uncompressed) datagram — used only for P2P control packets.</summary>
@@ -391,6 +456,7 @@ namespace OVS.Rollback.Core
         public async ValueTask DisposeAsync()
         {
             await StopAsync();
+            _guestIdleTimer?.Dispose();
             foreach (var client in _p2pClients.Values) client.Dispose();
             _p2pClients.Clear();
             _p2p?.Dispose();
@@ -463,6 +529,14 @@ namespace OVS.Rollback.Core
                 // meant for it, so feeding all is safe.
                 foreach (var client in _p2pClients.Values)
                     client.HandleDatagram(buffer.AsSpan(0, length), remote);
+                return;
+            }
+
+            // Guest proxy: in guest mode, non-control datagrams are game traffic —
+            // bridge local game ↔ host instead of running the authority path.
+            if (_guestMode)
+            {
+                HandleGuestDatagram(buffer, length, remote);
                 return;
             }
 
@@ -749,6 +823,20 @@ namespace OVS.Rollback.Core
             string playerName = "Unknown";
             string playerCharacter = "Unknown";
             ushort payloadIndex = payload.PlayerData.PlayerIndex;
+
+            // Guest role: if the LOCAL game (loopback) is joining a P2P match in
+            // which this machine is NOT the host, bridge it to the host instead
+            // of running authority here. Produces no player/reply; the game's
+            // traffic is proxied by HandleGuestDatagram from now on.
+            if (IPAddress.IsLoopback(remote.Address)
+                && matchConfig is not null && matchConfig.P2PMode != P2PMode.Off
+                && !string.IsNullOrWhiteSpace(matchConfig.Coordinator)
+                && payloadIndex < 8888 && !_guestMode
+                && TryEnterGuestMode(matchConfig, matchData.MatchId, matchData.Key, payloadIndex, remote))
+            {
+                _matches.TryRemove(matchData.MatchId, out _); // no authority state for a guest
+                return null;
+            }
 
             if (match.Players.TryGetValue(key, out var existingPlayer))
             {
