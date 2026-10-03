@@ -100,7 +100,12 @@ namespace OVS.Rollback.P2P
         // Per-match config, populated by EnableMatch (off the receive path).
         private readonly ConcurrentDictionary<string, P2PMatchInfo> _matchInfo = new();
         // Registrations that arrived before EnableMatch; drained when it fires.
-        private sealed record PendingRegistration(IPEndPoint Endpoint, string Key);
+        private sealed record PendingRegistration(IPEndPoint Endpoint, string Key, long ReceivedTs);
+        // Early registrations are buffered before their key can be checked, so the
+        // buffer is bounded: this many matches, this many indices each, and the
+        // sweep drops anything older than the registration timeout.
+        private const int MaxPendingMatches = 256;
+        private const int MaxPendingPerMatch = 16;
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<ushort, PendingRegistration>> _pending = new();
         // Maps a live reflexive endpoint back to (matchId, playerIndex) so packets
         // that don't carry a matchId (PunchResult/KeepAlive/RelayData) can be routed.
@@ -182,8 +187,10 @@ namespace OVS.Rollback.P2P
             // here — the receive loop must never block on the network.
             if (!_matchInfo.ContainsKey(matchId))
             {
+                if (!_pending.ContainsKey(matchId) && _pending.Count >= MaxPendingMatches) return;
                 var bucket = _pending.GetOrAdd(matchId, _ => new ConcurrentDictionary<ushort, PendingRegistration>());
-                bucket[playerIndex] = new PendingRegistration(endpoint, msg.Key);
+                if (!bucket.ContainsKey(playerIndex) && bucket.Count >= MaxPendingPerMatch) return;
+                bucket[playerIndex] = new PendingRegistration(endpoint, msg.Key, Stopwatch.GetTimestamp());
 
                 // Close the race where EnableMatch wrote _matchInfo and drained an
                 // empty bucket between our ContainsKey check and this write: if the
@@ -482,6 +489,17 @@ namespace OVS.Rollback.P2P
             // Collected under each session's gate, fired AFTER the loop so the
             // report callback (async HTTP) never runs while holding a lock.
             List<(string matchId, ushort index)>? drops = null;
+
+            // Registrations for a match that was never enabled (an Off match, or a
+            // made-up matchId) would otherwise wait here forever.
+            foreach (var kv in _pending)
+            {
+                bool stale = true;
+                foreach (var reg in kv.Value.Values)
+                    if (Stopwatch.GetElapsedTime(reg.ReceivedTs).TotalMilliseconds < _settings.RegistrationTimeoutMs * 2)
+                        stale = false;
+                if (stale) _pending.TryRemove(kv.Key, out _);
+            }
 
             foreach (var session in _sessions.Values)
             {

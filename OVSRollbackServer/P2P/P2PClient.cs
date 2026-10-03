@@ -54,6 +54,8 @@ namespace OVS.Rollback.P2P
         private ushort _punchIntervalMs;
 
         public PeerRole Role { get; private set; } = PeerRole.Guest;
+        // The peer the coordinator's PeerList names as host, if any.
+        private ushort? _hostIndex;
         public IPEndPoint? PublicEndpoint { get; private set; }
         public bool IsRegistered => _registered;
 
@@ -92,11 +94,9 @@ namespace OVS.Rollback.P2P
         /// <summary>Endpoint of the elected host (for a guest to forward its game to). Null until known.</summary>
         public IPEndPoint? HostEndpoint()
         {
-            foreach (var kv in _peers)
-                if (kv.Key != _myIndex && _routes.TryGetValue(kv.Key, out var r) && r == Route.Direct
-                    && _directEndpoints.TryGetValue(kv.Key, out var ep))
-                    return ep;
-            return null;
+            if (_hostIndex is not ushort host) return null;
+            return _routes.TryGetValue(host, out var r) && r == Route.Direct
+                && _directEndpoints.TryGetValue(host, out var ep) ? ep : null;
         }
 
         // ═══════════════════════════════════════════
@@ -124,7 +124,10 @@ namespace OVS.Rollback.P2P
                 return true;
             }
 
-            // Otherwise it's a server→client control message from the coordinator.
+            // Otherwise it's a server→client control message, which only the
+            // coordinator may send: one from anyone else (a forged UseDirect would
+            // redirect our game) is dropped.
+            if (!from.Equals(_coordinator)) return true;
             var srv = P2PControl.ParseServer(data);
             if (srv.HasValue) HandleServer(srv.Value);
             return true;
@@ -148,6 +151,7 @@ namespace OVS.Rollback.P2P
                         foreach (var (index, role, ep) in msg.Peers)
                         {
                             if (index == _myIndex) { Role = role; continue; }
+                            if (role == PeerRole.Host) _hostIndex = index;
                             _peers[index] = ep;
                             _routes.TryAdd(index, Route.Pending);
                         }

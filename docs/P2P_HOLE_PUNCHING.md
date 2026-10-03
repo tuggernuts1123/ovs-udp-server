@@ -300,3 +300,39 @@ switch back to today's dedicated-server behavior.
 - Backend `p2p_mode` emission (Section 6).
 - Optional host-local authority (Section 5.3).
 - End-to-end latency/success telemetry dashboards.
+
+## 11. Known gaps (review of the whole branch, 2026-10-03)
+
+This has never run end to end: the game client does not launch the local exe yet
+(`SpawnP2PServer` is a stub). A review of the branch found these gaps, still open:
+
+1. **The cloud coordinator never enables exe-hosted matches.** `EnableMatch` is only
+   called from the cloud's `HandleNewConnection`, which needs a game to connect to the
+   cloud. In the exe flow every game connects to its own local exe, so every Register
+   stays buffered and punching never starts. The cloud needs to enable the match when it
+   fetches the config for a P2P match, not on a game connection.
+2. **A guest's game can be left with nowhere to go.** In guest mode the game is
+   forwarded only once the host's route is Direct. A pair sent to Relay, a failed Forced
+   match, or a lost UseDirect (it is sent once) leaves the guest forwarding nothing, and
+   the game's retransmits keep the 30 s idle sweep from ever clearing guest mode. Guests
+   need a Relay path to the host and a timeout back to the cloud.
+3. **Both exes can decide they are guests.** The exe picks host or guest from the
+   config's `is_host` alone, while the coordinator falls back to the lowest index when no
+   one is flagged. With no `is_host`, nothing runs the authority. The exe should take its
+   role from the coordinator's RegisterAck / PeerList.
+4. **A normal match end can be reported as a leaver** (once 1 is fixed). The host's client
+   is disposed at match cleanup while the guest keeps sending keepalives, so 3 s later the
+   coordinator reports the host as dropped. A NAT rebind does the same: keepalives from the
+   new port are ignored and the client does not re-register. The coordinator should stop
+   drop detection when the match ends, and clients should re-register on rebind.
+5. **One player can register in another's slot** if the match key is shared by all
+   players: re-registering under the opponent's index moves their endpoint, and they are
+   reported as the leaver. Registration needs a per-player secret.
+
+Fixed in the same review: early registrations are bounded and expire, clients accept
+server→client control messages only from the coordinator, and a guest forwards to the
+peer the coordinator named as host (not the first direct peer).
+
+The backend half is in the web server's `holepunch` branch. It has one gap of its own: a
+P2P player is always pointed at `127.0.0.1:P2P_LOCAL_PORT`, so if their exe dies inside
+the 30 s readiness window there is no fallback to the cloud relay.
