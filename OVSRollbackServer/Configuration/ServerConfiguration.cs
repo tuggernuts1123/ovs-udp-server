@@ -360,6 +360,7 @@ namespace OVS.Rollback.Configuration
             P2P.PunchIntervalMs = GetEnvUShort("P2P__PunchIntervalMs", P2P.PunchIntervalMs);
             P2P.PunchStartDelayMs = GetEnvUShort("P2P__PunchStartDelayMs", P2P.PunchStartDelayMs);
             P2P.PeerLivenessTimeoutMs = GetEnvInt("P2P__PeerLivenessTimeoutMs", P2P.PeerLivenessTimeoutMs);
+            P2P.PeerDropReportMs = GetEnvInt("P2P__PeerDropReportMs", P2P.PeerDropReportMs);
             P2P.RelayEnabled = GetEnvBool("P2P__RelayEnabled", P2P.RelayEnabled);
             P2P.Role = GetEnvString("P2P__Role", P2P.Role) ?? "cloud";
             P2P.PeerAddress = GetEnvString("P2P__PeerAddress", P2P.PeerAddress) ?? "";
@@ -456,6 +457,9 @@ namespace OVS.Rollback.Configuration
 
         /// <summary>Evict a coordination session after every peer has been silent this long (ms).</summary>
         public int PeerLivenessTimeoutMs { get; set; } = 15000;
+
+        /// <summary>Report a peer as the leaver once it has been silent this long during an active match while another peer is still alive (ms).</summary>
+        public int PeerDropReportMs { get; set; } = 3000;
 
         /// <summary>Whether the server acts as a TURN-style relay when a direct hole can't be opened.</summary>
         public bool RelayEnabled { get; set; } = true;

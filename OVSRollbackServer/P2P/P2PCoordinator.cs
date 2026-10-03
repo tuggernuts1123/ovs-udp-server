@@ -38,7 +38,8 @@ namespace OVS.Rollback.P2P
     public sealed record P2PMatchInfo(
         P2PMode Mode,
         int ExpectedPeers,
-        IReadOnlyDictionary<ushort, bool> HostByIndex);
+        IReadOnlyDictionary<ushort, bool> HostByIndex,
+        string Key);
 
     /// <summary>Tunable coordination parameters (mirrors ServerConfiguration.Networking.P2P).</summary>
     public sealed record P2PSettings(
@@ -49,7 +50,12 @@ namespace OVS.Rollback.P2P
         ushort PunchIntervalMs,
         ushort PunchStartDelayMs,
         int PeerLivenessTimeoutMs,
-        bool RelayEnabled)
+        bool RelayEnabled,
+        // How long a peer may be silent (no keepalives) during an ACTIVE match
+        // before the coordinator reports it as the leaver to the backend. Well
+        // above the ~250ms keepalive cadence so ordinary loss/jitter can't trip
+        // it. Defaulted so existing positional constructors stay source-compatible.
+        int PeerDropReportMs = 3000)
     {
         public static P2PSettings Defaults => new(
             Enabled: false,
@@ -59,7 +65,8 @@ namespace OVS.Rollback.P2P
             PunchIntervalMs: 100,
             PunchStartDelayMs: 250,
             PeerLivenessTimeoutMs: 15000,
-            RelayEnabled: true);
+            RelayEnabled: true,
+            PeerDropReportMs: 3000);
     }
 
     public sealed class P2PCoordinator : IDisposable
@@ -81,6 +88,9 @@ namespace OVS.Rollback.P2P
             public long LastActivityTs;
             public ushort HostIndex;
             public bool HostResolved;
+            // Set once we've reported a one-sided peer drop to the backend, so a
+            // single leaver is reported exactly once per match.
+            public bool DropReported;
             public readonly object Gate = new();
             // Pairs already told their final route, so we don't spam UseDirect/UseRelay.
             public readonly ConcurrentDictionary<(ushort, ushort), PeerRoute> ResolvedPairs = new();
@@ -90,12 +100,17 @@ namespace OVS.Rollback.P2P
         // Per-match config, populated by EnableMatch (off the receive path).
         private readonly ConcurrentDictionary<string, P2PMatchInfo> _matchInfo = new();
         // Registrations that arrived before EnableMatch; drained when it fires.
-        private readonly ConcurrentDictionary<string, ConcurrentDictionary<ushort, IPEndPoint>> _pending = new();
+        private sealed record PendingRegistration(IPEndPoint Endpoint, string Key);
+        private readonly ConcurrentDictionary<string, ConcurrentDictionary<ushort, PendingRegistration>> _pending = new();
         // Maps a live reflexive endpoint back to (matchId, playerIndex) so packets
         // that don't carry a matchId (PunchResult/KeepAlive/RelayData) can be routed.
         private readonly ConcurrentDictionary<string, (string matchId, ushort index)> _endpointOwners = new();
 
         private readonly Action<byte[], IPEndPoint> _send;
+        // Invoked when a peer goes silent mid-match while another peer is still
+        // alive (the leaver). Args: (matchId, droppedPlayerIndex). Optional; when
+        // null, drop detection still runs but nothing is reported.
+        private readonly Action<string, ushort>? _onPeerDropped;
         private readonly ILogger _logger;
         private readonly P2PSettings _settings;
         private readonly Timer _sweepTimer;
@@ -104,9 +119,11 @@ namespace OVS.Rollback.P2P
         public P2PCoordinator(
             Action<byte[], IPEndPoint> send,
             P2PSettings settings,
-            ILogger logger)
+            ILogger logger,
+            Action<string, ushort>? onPeerDropped = null)
         {
             _send = send;
+            _onPeerDropped = onPeerDropped;
             _settings = settings;
             _logger = logger;
             // Sweep drives the registration/punch timeouts and liveness eviction.
@@ -132,7 +149,7 @@ namespace OVS.Rollback.P2P
             if (_pending.TryRemove(matchId, out var early))
             {
                 foreach (var kv in early)
-                    IngestRegistration(matchId, kv.Key, kv.Value);
+                    IngestRegistration(matchId, kv.Key, kv.Value.Endpoint, kv.Value.Key);
             }
         }
 
@@ -165,8 +182,8 @@ namespace OVS.Rollback.P2P
             // here — the receive loop must never block on the network.
             if (!_matchInfo.ContainsKey(matchId))
             {
-                var bucket = _pending.GetOrAdd(matchId, _ => new ConcurrentDictionary<ushort, IPEndPoint>());
-                bucket[playerIndex] = endpoint;
+                var bucket = _pending.GetOrAdd(matchId, _ => new ConcurrentDictionary<ushort, PendingRegistration>());
+                bucket[playerIndex] = new PendingRegistration(endpoint, msg.Key);
 
                 // Close the race where EnableMatch wrote _matchInfo and drained an
                 // empty bucket between our ContainsKey check and this write: if the
@@ -174,25 +191,35 @@ namespace OVS.Rollback.P2P
                 // than leaving it stranded until the client's next retransmit.
                 if (_matchInfo.ContainsKey(matchId)
                     && _pending.TryGetValue(matchId, out var b)
-                    && b.TryRemove(playerIndex, out var ep))
+                    && b.TryRemove(playerIndex, out var pending))
                 {
-                    IngestRegistration(matchId, playerIndex, ep);
+                    IngestRegistration(matchId, playerIndex, pending.Endpoint, pending.Key);
                 }
                 return;
             }
 
-            IngestRegistration(matchId, playerIndex, endpoint);
+            IngestRegistration(matchId, playerIndex, endpoint, msg.Key);
         }
 
-        private void IngestRegistration(string matchId, ushort playerIndex, IPEndPoint endpoint)
+        private void IngestRegistration(string matchId, ushort playerIndex, IPEndPoint endpoint, string key)
         {
             if (!_matchInfo.TryGetValue(matchId, out var info) || info.Mode == P2PMode.Off)
                 return;
+            if (string.IsNullOrEmpty(info.Key) || !StringComparer.Ordinal.Equals(info.Key, key))
+            {
+                _logger.LogWarning("[P2P] Rejected registration with bad key match={Match} idx={Idx}", matchId, playerIndex);
+                return;
+            }
+            if (!info.HostByIndex.ContainsKey(playerIndex))
+            {
+                _logger.LogWarning("[P2P] Rejected unexpected player index match={Match} idx={Idx}", matchId, playerIndex);
+                return;
+            }
 
             var session = _sessions.GetOrAdd(matchId, id => new Session
             {
                 MatchId = id,
-                Key = string.Empty,
+                Key = info.Key,
                 Mode = info.Mode,
                 ExpectedPeers = info.ExpectedPeers,
                 HostByIndex = info.HostByIndex,
@@ -452,6 +479,10 @@ namespace OVS.Rollback.P2P
 
         private void Sweep()
         {
+            // Collected under each session's gate, fired AFTER the loop so the
+            // report callback (async HTTP) never runs while holding a lock.
+            List<(string matchId, ushort index)>? drops = null;
+
             foreach (var session in _sessions.Values)
             {
                 lock (session.Gate)
@@ -494,7 +525,52 @@ namespace OVS.Rollback.P2P
                                 }
                         }
                     }
+
+                    // One-sided peer drop during an ACTIVE (Established) P2P match:
+                    // the first peer to go silent while another is still sending
+                    // keepalives is the leaver. Report it ONCE so the backend can
+                    // resolve the forfeit — and, crucially, so the still-alive peer
+                    // (the victim of an Alt-F4 or a host-exe crash) is provably not
+                    // blamed. If EVERY peer is silent it's a normal match end or a
+                    // mutual crash, not a one-sided leave, so we report nothing.
+                    if (session.Phase == P2PSessionPhase.Established
+                        && !session.DropReported
+                        && session.Peers.Count >= 2)
+                    {
+                        P2PPeer? earliestSilent = null;
+                        bool anyFresh = false;
+                        foreach (var peer in session.Peers.Values)
+                        {
+                            double silentMs = Stopwatch.GetElapsedTime(peer.LastSeenTimestamp).TotalMilliseconds;
+                            if (silentMs > _settings.PeerDropReportMs)
+                            {
+                                // Smaller timestamp == went silent earlier == first to drop.
+                                if (earliestSilent is null || peer.LastSeenTimestamp < earliestSilent.LastSeenTimestamp)
+                                    earliestSilent = peer;
+                            }
+                            else
+                            {
+                                anyFresh = true;
+                            }
+                        }
+
+                        if (earliestSilent is not null && anyFresh)
+                        {
+                            session.DropReported = true;
+                            (drops ??= new()).Add((session.MatchId, earliestSilent.PlayerIndex));
+                            _logger.LogWarning(
+                                "[P2P] Peer idx={Idx} went silent in active match={Match} while peer(s) still alive — reporting as leaver",
+                                earliestSilent.PlayerIndex, session.MatchId);
+                        }
+                    }
                 }
+            }
+
+            // Fire drop reports outside every session gate (callback does async HTTP).
+            if (drops is not null && _onPeerDropped is not null)
+            {
+                foreach (var d in drops)
+                    _onPeerDropped(d.matchId, d.index);
             }
 
             // Evict dead sessions (all peers gone silent). Re-checked under the

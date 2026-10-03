@@ -49,6 +49,8 @@ namespace OVS.Rollback.Utils
         public string MatchStatusPath { get => Endpoints.OVSMatchStatus; }
         public string MatchStatusURL { get => BaseUrl + MatchStatusPath; }
 
+        public string P2PPeerDroppedURL { get => BaseUrl + Endpoints.OVSP2PPeerDropped; }
+
         private ServerConfiguration Config { get => Singletons.Config; }
 
         private string parsedMatchUpdateKey { get => Config.Server.MatchUpdateKey ?? "MisconfiguredMatchUpdateKey"; }
@@ -210,6 +212,30 @@ namespace OVS.Rollback.Utils
             catch (Exception ex)
             {
                 Log.EndMatchFailed(_logger, EndMatchURL, ex);
+            }
+        }
+
+        /// <summary>
+        /// Report to the backend that a peer went silent (stopped sending P2P
+        /// keepalives) during an active P2P match while another peer was still
+        /// alive — i.e. that peer is the leaver. Authenticated by MatchUpdateKey,
+        /// so this is a TRUSTED cloud-coordinator signal the backend can act on
+        /// for ELO (unlike anything the client-side exe could forge). Fire-and-
+        /// forget: a failed report just falls back to the WS-close path.
+        /// </summary>
+        protected internal async Task SendP2PPeerDropped(string matchId, ushort droppedIndex)
+        {
+            try
+            {
+                await PostJsonAsync(
+                    url: P2PPeerDroppedURL,
+                    data: new { matchId, droppedIndex },
+                    returnBody: false);
+                _logger.LogInformation("{LogPrefix} Reported P2P peer drop match={Match} idx={Idx}", LogPrefix, matchId, droppedIndex);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "{LogPrefix} Failed to report P2P peer drop for match={Match}", LogPrefix, matchId);
             }
         }
 

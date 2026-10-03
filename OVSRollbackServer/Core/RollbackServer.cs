@@ -119,7 +119,12 @@ namespace OVS.Rollback.Core
             var p2pCfg = ServerConfiguration.Instance.P2P;
             if (p2pCfg.Enabled)
             {
-                _p2p = new P2PCoordinator(SendRawTo, BuildP2PSettings(), _logger);
+                _p2p = new P2PCoordinator(SendRawTo, BuildP2PSettings(), _logger,
+                    // When the coordinator sees a peer go silent mid-match while
+                    // another is still alive, report the leaver to the backend over
+                    // the trusted (MatchUpdateKey-authenticated) channel. Fire-and-
+                    // forget; the WS-close path remains a fallback.
+                    onPeerDropped: (matchId, idx) => _ = _httpHelper.SendP2PPeerDropped(matchId, idx));
                 _logger.LogInformation(
                     "[P2P] Coordinator enabled (attempts={Attempts}, interval={Interval}ms, relay={Relay})",
                     p2pCfg.PunchAttempts, p2pCfg.PunchIntervalMs, p2pCfg.RelayEnabled);
@@ -142,7 +147,8 @@ namespace OVS.Rollback.Core
                 PunchIntervalMs: c.PunchIntervalMs,
                 PunchStartDelayMs: c.PunchStartDelayMs,
                 PeerLivenessTimeoutMs: c.PeerLivenessTimeoutMs,
-                RelayEnabled: c.RelayEnabled);
+                RelayEnabled: c.RelayEnabled,
+                PeerDropReportMs: c.PeerDropReportMs);
         }
 
         /// <summary>
@@ -354,7 +360,7 @@ namespace OVS.Rollback.Core
         /// I/O ever touches the UDP receive loop. Returns null if the match isn't
         /// opted into P2P.
         /// </summary>
-        private static P2PMatchInfo? BuildP2PMatchInfo(OVSMatchConfig cfg)
+        private static P2PMatchInfo? BuildP2PMatchInfo(OVSMatchConfig cfg, string matchKey)
         {
             if (cfg.P2PMode == P2PMode.Off) return null;
 
@@ -370,7 +376,7 @@ namespace OVS.Rollback.Core
                 hostByIndex[p.PlayerIndex] = p.IsHost;
                 expectedPeers++;
             }
-            return new P2PMatchInfo(cfg.P2PMode, expectedPeers, hostByIndex);
+            return new P2PMatchInfo(cfg.P2PMode, expectedPeers, hostByIndex, matchKey);
         }
 
         public void Start()
@@ -806,7 +812,7 @@ namespace OVS.Rollback.Core
                     // opted into P2P or the coordinator is disabled.
                     if (_p2p is not null)
                     {
-                        var p2pInfo = BuildP2PMatchInfo(config);
+                        var p2pInfo = BuildP2PMatchInfo(config, matchData.Key);
                         if (p2pInfo is not null)
                             _p2p.EnableMatch(matchData.MatchId, p2pInfo);
                     }
